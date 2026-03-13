@@ -1,21 +1,17 @@
 ---
-title: OpenClaw to FreshHouse Translation Matrix
-status: draft
-created: '2026-03-13'
+title: OpenClaw to FreshHouse Translation Matrix (filled)
+status: active
 updated: '2026-03-13'
 ---
 
 # OpenClaw to FreshHouse Translation Matrix
 
-| OpenClaw concept | Where found in OpenClaw | FreshHouse equivalent | Decision (adopt/adapt/reject) | Notes |
+| OpenClaw concept | Where found in OpenClaw | FreshHouse equivalent | Decision | Notes |
 |---|---|---|---|---|
-| SOUL.md | TBD | `0_amplify-systems/docs/quan/soul.md` and `0_amplify-systems/docs/sky-fresh-singh/SOUL.md` | adapt | Keep identity canon, avoid blind runtime parity |
-| Identity companion docs | TBD | `*-LINGUISTICS-CANONICAL.md` | adapt | Canonical language enforced by runtime contract |
-| Prompt assembly order | TBD | `RUNTIME-PROMPT-CONTRACTS-QUAN-AND-SKY-FRESH-SINGH.md` | adopt | Deterministic order reduces drift |
-| Bootstrap workspace files | TBD | Existing docs + PM indexes | adapt | Use docs and PM metadata instead of one-to-one replication |
-| Tool trust boundaries | TBD | Existing protocol/rules in FreshHouse | adopt | Preserve evidence-first output behavior |
+| SOUL.md | docs/reference/templates/SOUL.md; src/agents/workspace.ts (DEFAULT_SOUL_FILENAME, loadTemplate); Project Context | quan/soul.md, sky-fresh-singh/SOUL.md | adapt | Identity by contract from known paths |
+| Identity companion docs | IDENTITY.md, USER.md in templates | *-LINGUISTICS-CANONICAL.md | adapt | Canonical language via runtime contract |
+| Prompt assembly order | workspace.ts load order AGENTS→SOUL→TOOLS→IDENTITY→USER→HEARTBEAT→BOOTSTRAP→MEMORY; system-prompt.ts Project Context | RUNTIME-PROMPT-CONTRACTS | adopt | Deterministic order |
+| Bootstrap workspace files | workspace.ts ensureAgentWorkspace, VALID_BOOTSTRAP_NAMES; workspace-templates.ts | Docs + PM indexes | adapt | No 1:1 replication |
+| Tool trust boundaries | system-prompt.ts Safety; security/audit-extra.async.ts; dangerous-config-flags.ts | FreshHouse protocol/rules | adopt | Evidence-first |
 
-## Notes
-
-- Fill "Where found in OpenClaw" with exact file paths and symbols during analysis.
-- Every matrix row must end with an explicit decision.
+Full findings: FreshHouse-Network 0_amplify-systems/docs/implementation/OPENCLAW-FINDINGS.md
