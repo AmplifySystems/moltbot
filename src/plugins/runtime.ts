@@ -1,26 +1,11 @@
-import type { PluginRegistry } from "./registry.js";
+import { createEmptyPluginRegistry, type PluginRegistry } from "./registry.js";
 
-const createEmptyRegistry = (): PluginRegistry => ({
-  plugins: [],
-  tools: [],
-  hooks: [],
-  typedHooks: [],
-  channels: [],
-  providers: [],
-  gatewayHandlers: {},
-  httpHandlers: [],
-  httpRoutes: [],
-  cliRegistrars: [],
-  services: [],
-  commands: [],
-  diagnostics: [],
-});
-
-const REGISTRY_STATE = Symbol.for("moltbot.pluginRegistryState");
+const REGISTRY_STATE = Symbol.for("openclaw.pluginRegistryState");
 
 type RegistryState = {
   registry: PluginRegistry | null;
   key: string | null;
+  version: number;
 };
 
 const state: RegistryState = (() => {
@@ -29,16 +14,18 @@ const state: RegistryState = (() => {
   };
   if (!globalState[REGISTRY_STATE]) {
     globalState[REGISTRY_STATE] = {
-      registry: createEmptyRegistry(),
+      registry: createEmptyPluginRegistry(),
       key: null,
+      version: 0,
     };
   }
-  return globalState[REGISTRY_STATE] as RegistryState;
+  return globalState[REGISTRY_STATE];
 })();
 
 export function setActivePluginRegistry(registry: PluginRegistry, cacheKey?: string) {
   state.registry = registry;
   state.key = cacheKey ?? null;
+  state.version += 1;
 }
 
 export function getActivePluginRegistry(): PluginRegistry | null {
@@ -47,11 +34,16 @@ export function getActivePluginRegistry(): PluginRegistry | null {
 
 export function requireActivePluginRegistry(): PluginRegistry {
   if (!state.registry) {
-    state.registry = createEmptyRegistry();
+    state.registry = createEmptyPluginRegistry();
+    state.version += 1;
   }
   return state.registry;
 }
 
 export function getActivePluginRegistryKey(): string | null {
   return state.key;
+}
+
+export function getActivePluginRegistryVersion(): number {
+  return state.version;
 }

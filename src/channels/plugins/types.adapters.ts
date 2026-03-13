@@ -1,7 +1,9 @@
-import type { MoltbotConfig } from "../../config/config.js";
 import type { ReplyPayload } from "../../auto-reply/types.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import type { GroupToolPolicyConfig } from "../../config/types.tools.js";
 import type { OutboundDeliveryResult, OutboundSendDeps } from "../../infra/outbound/deliver.js";
+import type { OutboundIdentity } from "../../infra/outbound/identity.js";
+import type { PluginRuntime } from "../../plugins/runtime/types.js";
 import type { RuntimeEnv } from "../../runtime.js";
 import type {
   ChannelAccountSnapshot,
@@ -20,48 +22,62 @@ import type {
 } from "./types.core.js";
 
 export type ChannelSetupAdapter = {
-  resolveAccountId?: (params: { cfg: MoltbotConfig; accountId?: string }) => string;
+  resolveAccountId?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string;
+    input?: ChannelSetupInput;
+  }) => string;
+  resolveBindingAccountId?: (params: {
+    cfg: OpenClawConfig;
+    agentId: string;
+    accountId?: string;
+  }) => string | undefined;
   applyAccountName?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId: string;
     name?: string;
-  }) => MoltbotConfig;
+  }) => OpenClawConfig;
   applyAccountConfig: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId: string;
     input: ChannelSetupInput;
-  }) => MoltbotConfig;
+  }) => OpenClawConfig;
   validateInput?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId: string;
     input: ChannelSetupInput;
   }) => string | null;
 };
 
 export type ChannelConfigAdapter<ResolvedAccount> = {
-  listAccountIds: (cfg: MoltbotConfig) => string[];
-  resolveAccount: (cfg: MoltbotConfig, accountId?: string | null) => ResolvedAccount;
-  defaultAccountId?: (cfg: MoltbotConfig) => string;
+  listAccountIds: (cfg: OpenClawConfig) => string[];
+  resolveAccount: (cfg: OpenClawConfig, accountId?: string | null) => ResolvedAccount;
+  inspectAccount?: (cfg: OpenClawConfig, accountId?: string | null) => unknown;
+  defaultAccountId?: (cfg: OpenClawConfig) => string;
   setAccountEnabled?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId: string;
     enabled: boolean;
-  }) => MoltbotConfig;
-  deleteAccount?: (params: { cfg: MoltbotConfig; accountId: string }) => MoltbotConfig;
-  isEnabled?: (account: ResolvedAccount, cfg: MoltbotConfig) => boolean;
-  disabledReason?: (account: ResolvedAccount, cfg: MoltbotConfig) => string;
-  isConfigured?: (account: ResolvedAccount, cfg: MoltbotConfig) => boolean | Promise<boolean>;
-  unconfiguredReason?: (account: ResolvedAccount, cfg: MoltbotConfig) => string;
-  describeAccount?: (account: ResolvedAccount, cfg: MoltbotConfig) => ChannelAccountSnapshot;
+  }) => OpenClawConfig;
+  deleteAccount?: (params: { cfg: OpenClawConfig; accountId: string }) => OpenClawConfig;
+  isEnabled?: (account: ResolvedAccount, cfg: OpenClawConfig) => boolean;
+  disabledReason?: (account: ResolvedAccount, cfg: OpenClawConfig) => string;
+  isConfigured?: (account: ResolvedAccount, cfg: OpenClawConfig) => boolean | Promise<boolean>;
+  unconfiguredReason?: (account: ResolvedAccount, cfg: OpenClawConfig) => string;
+  describeAccount?: (account: ResolvedAccount, cfg: OpenClawConfig) => ChannelAccountSnapshot;
   resolveAllowFrom?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
-  }) => string[] | undefined;
+  }) => Array<string | number> | undefined;
   formatAllowFrom?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
     allowFrom: Array<string | number>;
   }) => string[];
+  resolveDefaultTo?: (params: {
+    cfg: OpenClawConfig;
+    accountId?: string | null;
+  }) => string | undefined;
 };
 
 export type ChannelGroupAdapter = {
@@ -71,15 +87,18 @@ export type ChannelGroupAdapter = {
 };
 
 export type ChannelOutboundContext = {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   to: string;
   text: string;
   mediaUrl?: string;
+  mediaLocalRoots?: readonly string[];
   gifPlayback?: boolean;
   replyToId?: string | null;
   threadId?: string | number | null;
   accountId?: string | null;
+  identity?: OutboundIdentity;
   deps?: OutboundSendDeps;
+  silent?: boolean;
 };
 
 export type ChannelOutboundPayloadContext = ChannelOutboundContext & {
@@ -93,7 +112,7 @@ export type ChannelOutboundAdapter = {
   textChunkLimit?: number;
   pollMaxOptions?: number;
   resolveTarget?: (params: {
-    cfg?: MoltbotConfig;
+    cfg?: OpenClawConfig;
     to?: string;
     allowFrom?: string[];
     accountId?: string | null;
@@ -105,41 +124,41 @@ export type ChannelOutboundAdapter = {
   sendPoll?: (ctx: ChannelPollContext) => Promise<ChannelPollResult>;
 };
 
-export type ChannelStatusAdapter<ResolvedAccount> = {
+export type ChannelStatusAdapter<ResolvedAccount, Probe = unknown, Audit = unknown> = {
   defaultRuntime?: ChannelAccountSnapshot;
   buildChannelSummary?: (params: {
     account: ResolvedAccount;
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     defaultAccountId: string;
     snapshot: ChannelAccountSnapshot;
   }) => Record<string, unknown> | Promise<Record<string, unknown>>;
   probeAccount?: (params: {
     account: ResolvedAccount;
     timeoutMs: number;
-    cfg: MoltbotConfig;
-  }) => Promise<unknown>;
+    cfg: OpenClawConfig;
+  }) => Promise<Probe>;
   auditAccount?: (params: {
     account: ResolvedAccount;
     timeoutMs: number;
-    cfg: MoltbotConfig;
-    probe?: unknown;
-  }) => Promise<unknown>;
+    cfg: OpenClawConfig;
+    probe?: Probe;
+  }) => Promise<Audit>;
   buildAccountSnapshot?: (params: {
     account: ResolvedAccount;
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     runtime?: ChannelAccountSnapshot;
-    probe?: unknown;
-    audit?: unknown;
+    probe?: Probe;
+    audit?: Audit;
   }) => ChannelAccountSnapshot | Promise<ChannelAccountSnapshot>;
   logSelfId?: (params: {
     account: ResolvedAccount;
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     runtime: RuntimeEnv;
     includeChannelPrefix?: boolean;
   }) => void;
   resolveAccountState?: (params: {
     account: ResolvedAccount;
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     configured: boolean;
     enabled: boolean;
   }) => ChannelAccountState;
@@ -147,7 +166,7 @@ export type ChannelStatusAdapter<ResolvedAccount> = {
 };
 
 export type ChannelGatewayContext<ResolvedAccount = unknown> = {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   accountId: string;
   account: ResolvedAccount;
   runtime: RuntimeEnv;
@@ -155,6 +174,68 @@ export type ChannelGatewayContext<ResolvedAccount = unknown> = {
   log?: ChannelLogSink;
   getStatus: () => ChannelAccountSnapshot;
   setStatus: (next: ChannelAccountSnapshot) => void;
+  /**
+   * Optional channel runtime helpers for external channel plugins.
+   *
+   * This field provides access to advanced Plugin SDK features that are
+   * available to external plugins but not to built-in channels (which can
+   * directly import internal modules).
+   *
+   * ## Available Features
+   *
+   * - **reply**: AI response dispatching, formatting, and delivery
+   * - **routing**: Agent route resolution and matching
+   * - **text**: Text chunking, markdown processing, and control command detection
+   * - **session**: Session management and metadata tracking
+   * - **media**: Remote media fetching and buffer saving
+   * - **commands**: Command authorization and control command handling
+   * - **groups**: Group policy resolution and mention requirements
+   * - **pairing**: Channel pairing and allow-from management
+   *
+   * ## Use Cases
+   *
+   * External channel plugins (e.g., email, SMS, custom integrations) that need:
+   * - AI-powered response generation and delivery
+   * - Advanced text processing and formatting
+   * - Session tracking and management
+   * - Agent routing and policy resolution
+   *
+   * ## Example
+   *
+   * ```typescript
+   * const emailGatewayAdapter: ChannelGatewayAdapter<EmailAccount> = {
+   *   startAccount: async (ctx) => {
+   *     // Check availability (for backward compatibility)
+   *     if (!ctx.channelRuntime) {
+   *       ctx.log?.warn?.("channelRuntime not available - skipping AI features");
+   *       return;
+   *     }
+   *
+   *     // Use AI dispatch
+   *     await ctx.channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+   *       ctx: { ... },
+   *       cfg: ctx.cfg,
+   *       dispatcherOptions: {
+   *         deliver: async (payload) => {
+   *           // Send reply via email
+   *         },
+   *       },
+   *     });
+   *   },
+   * };
+   * ```
+   *
+   * ## Backward Compatibility
+   *
+   * - This field is **optional** - channels that don't need it can ignore it
+   * - Built-in channels (slack, discord, etc.) typically don't use this field
+   *   because they can directly import internal modules
+   * - External plugins should check for undefined before using
+   *
+   * @since Plugin SDK 2026.2.19
+   * @see {@link https://docs.openclaw.ai/plugins/developing-plugins | Plugin SDK documentation}
+   */
+  channelRuntime?: PluginRuntime["channel"];
 };
 
 export type ChannelLogoutResult = {
@@ -174,7 +255,7 @@ export type ChannelLoginWithQrWaitResult = {
 };
 
 export type ChannelLogoutContext<ResolvedAccount = unknown> = {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   accountId: string;
   account: ResolvedAccount;
   runtime: RuntimeEnv;
@@ -185,7 +266,7 @@ export type ChannelPairingAdapter = {
   idLabel: string;
   normalizeAllowEntry?: (entry: string) => string;
   notifyApproval?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     id: string;
     runtime?: RuntimeEnv;
   }) => Promise<void>;
@@ -209,7 +290,7 @@ export type ChannelGatewayAdapter<ResolvedAccount = unknown> = {
 
 export type ChannelAuthAdapter = {
   login?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
     runtime: RuntimeEnv;
     verbose?: boolean;
@@ -219,57 +300,47 @@ export type ChannelAuthAdapter = {
 
 export type ChannelHeartbeatAdapter = {
   checkReady?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
     deps?: ChannelHeartbeatDeps;
   }) => Promise<{ ok: boolean; reason: string }>;
-  resolveRecipients?: (params: { cfg: MoltbotConfig; opts?: { to?: string; all?: boolean } }) => {
+  resolveRecipients?: (params: { cfg: OpenClawConfig; opts?: { to?: string; all?: boolean } }) => {
     recipients: string[];
     source: string;
   };
 };
 
+type ChannelDirectorySelfParams = {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  runtime: RuntimeEnv;
+};
+
+type ChannelDirectoryListParams = {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  query?: string | null;
+  limit?: number | null;
+  runtime: RuntimeEnv;
+};
+
+type ChannelDirectoryListGroupMembersParams = {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  groupId: string;
+  limit?: number | null;
+  runtime: RuntimeEnv;
+};
+
 export type ChannelDirectoryAdapter = {
-  self?: (params: {
-    cfg: MoltbotConfig;
-    accountId?: string | null;
-    runtime: RuntimeEnv;
-  }) => Promise<ChannelDirectoryEntry | null>;
-  listPeers?: (params: {
-    cfg: MoltbotConfig;
-    accountId?: string | null;
-    query?: string | null;
-    limit?: number | null;
-    runtime: RuntimeEnv;
-  }) => Promise<ChannelDirectoryEntry[]>;
-  listPeersLive?: (params: {
-    cfg: MoltbotConfig;
-    accountId?: string | null;
-    query?: string | null;
-    limit?: number | null;
-    runtime: RuntimeEnv;
-  }) => Promise<ChannelDirectoryEntry[]>;
-  listGroups?: (params: {
-    cfg: MoltbotConfig;
-    accountId?: string | null;
-    query?: string | null;
-    limit?: number | null;
-    runtime: RuntimeEnv;
-  }) => Promise<ChannelDirectoryEntry[]>;
-  listGroupsLive?: (params: {
-    cfg: MoltbotConfig;
-    accountId?: string | null;
-    query?: string | null;
-    limit?: number | null;
-    runtime: RuntimeEnv;
-  }) => Promise<ChannelDirectoryEntry[]>;
-  listGroupMembers?: (params: {
-    cfg: MoltbotConfig;
-    accountId?: string | null;
-    groupId: string;
-    limit?: number | null;
-    runtime: RuntimeEnv;
-  }) => Promise<ChannelDirectoryEntry[]>;
+  self?: (params: ChannelDirectorySelfParams) => Promise<ChannelDirectoryEntry | null>;
+  listPeers?: (params: ChannelDirectoryListParams) => Promise<ChannelDirectoryEntry[]>;
+  listPeersLive?: (params: ChannelDirectoryListParams) => Promise<ChannelDirectoryEntry[]>;
+  listGroups?: (params: ChannelDirectoryListParams) => Promise<ChannelDirectoryEntry[]>;
+  listGroupsLive?: (params: ChannelDirectoryListParams) => Promise<ChannelDirectoryEntry[]>;
+  listGroupMembers?: (
+    params: ChannelDirectoryListGroupMembersParams,
+  ) => Promise<ChannelDirectoryEntry[]>;
 };
 
 export type ChannelResolveKind = "user" | "group";
@@ -284,7 +355,7 @@ export type ChannelResolveResult = {
 
 export type ChannelResolverAdapter = {
   resolveTargets: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
     inputs: string[];
     kind: ChannelResolveKind;
@@ -294,7 +365,7 @@ export type ChannelResolverAdapter = {
 
 export type ChannelElevatedAdapter = {
   allowFromFallback?: (params: {
-    cfg: MoltbotConfig;
+    cfg: OpenClawConfig;
     accountId?: string | null;
   }) => Array<string | number> | undefined;
 };

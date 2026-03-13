@@ -4,7 +4,9 @@ import type { loadConfig } from "../../../config/config.js";
 import type { WebInboundMsg } from "../types.js";
 
 export function formatReplyContext(msg: WebInboundMsg) {
-  if (!msg.replyToBody) return null;
+  if (!msg.replyToBody) {
+    return null;
+  }
   const sender = msg.replyToSender ?? "unknown sender";
   const idPart = msg.replyToId ? ` id:${msg.replyToId}` : "";
   return `[Replying to ${sender}${idPart}]\n${msg.replyToBody}\n[/Replying]`;
@@ -41,5 +43,6 @@ export function buildInboundLine(params: {
     },
     previousTimestamp,
     envelope,
+    fromMe: msg.fromMe,
   });
 }

@@ -5,15 +5,15 @@
  * These commands are processed before built-in commands and before agent invocation.
  */
 
-import type { MoltbotConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/config.js";
+import { logVerbose } from "../globals.js";
 import type {
-  MoltbotPluginCommandDefinition,
+  OpenClawPluginCommandDefinition,
   PluginCommandContext,
   PluginCommandResult,
 } from "./types.js";
-import { logVerbose } from "../globals.js";
 
-type RegisteredPluginCommand = MoltbotPluginCommandDefinition & {
+type RegisteredPluginCommand = OpenClawPluginCommandDefinition & {
   pluginId: string;
 };
 
@@ -51,6 +51,9 @@ const RESERVED_COMMANDS = new Set([
   // Agent control
   "skill",
   "subagents",
+  "kill",
+  "steer",
+  "tell",
   "model",
   "models",
   "queue",
@@ -104,7 +107,7 @@ export type CommandRegistrationResult = {
  */
 export function registerPluginCommand(
   pluginId: string,
-  command: MoltbotPluginCommandDefinition,
+  command: OpenClawPluginCommandDefinition,
 ): CommandRegistrationResult {
   // Prevent registration while commands are being processed
   if (registryLocked) {
@@ -116,23 +119,36 @@ export function registerPluginCommand(
     return { ok: false, error: "Command handler must be a function" };
   }
 
-  const validationError = validateCommandName(command.name);
+  if (typeof command.name !== "string") {
+    return { ok: false, error: "Command name must be a string" };
+  }
+  if (typeof command.description !== "string") {
+    return { ok: false, error: "Command description must be a string" };
+  }
+
+  const name = command.name.trim();
+  const description = command.description.trim();
+  if (!description) {
+    return { ok: false, error: "Command description cannot be empty" };
+  }
+
+  const validationError = validateCommandName(name);
   if (validationError) {
     return { ok: false, error: validationError };
   }
 
-  const key = `/${command.name.toLowerCase()}`;
+  const key = `/${name.toLowerCase()}`;
 
   // Check for duplicate registration
   if (pluginCommands.has(key)) {
     const existing = pluginCommands.get(key)!;
     return {
       ok: false,
-      error: `Command "${command.name}" already registered by plugin "${existing.pluginId}"`,
+      error: `Command "${name}" already registered by plugin "${existing.pluginId}"`,
     };
   }
 
-  pluginCommands.set(key, { ...command, pluginId });
+  pluginCommands.set(key, { ...command, name, description, pluginId });
   logVerbose(`Registered plugin command: ${key} (plugin: ${pluginId})`);
   return { ok: true };
 }
@@ -168,7 +184,9 @@ export function matchPluginCommand(
   commandBody: string,
 ): { command: RegisteredPluginCommand; args?: string } | null {
   const trimmed = commandBody.trim();
-  if (!trimmed.startsWith("/")) return null;
+  if (!trimmed.startsWith("/")) {
+    return null;
+  }
 
   // Extract command name and args
   const spaceIndex = trimmed.indexOf(" ");
@@ -178,10 +196,14 @@ export function matchPluginCommand(
   const key = commandName.toLowerCase();
   const command = pluginCommands.get(key);
 
-  if (!command) return null;
+  if (!command) {
+    return null;
+  }
 
   // If command doesn't accept args but args were provided, don't match
-  if (args && !command.acceptsArgs) return null;
+  if (args && !command.acceptsArgs) {
+    return null;
+  }
 
   return { command, args: args || undefined };
 }
@@ -191,7 +213,9 @@ export function matchPluginCommand(
  * Removes control characters and enforces length limits.
  */
 function sanitizeArgs(args: string | undefined): string | undefined {
-  if (!args) return undefined;
+  if (!args) {
+    return undefined;
+  }
 
   // Enforce length limit
   if (args.length > MAX_ARGS_LENGTH) {
@@ -203,7 +227,9 @@ function sanitizeArgs(args: string | undefined): string | undefined {
   for (const char of args) {
     const code = char.charCodeAt(0);
     const isControl = (code <= 0x1f && code !== 0x09 && code !== 0x0a) || code === 0x7f;
-    if (!isControl) sanitized += char;
+    if (!isControl) {
+      sanitized += char;
+    }
   }
   return sanitized;
 }
@@ -219,9 +245,14 @@ export async function executePluginCommand(params: {
   args?: string;
   senderId?: string;
   channel: string;
+  channelId?: PluginCommandContext["channelId"];
   isAuthorizedSender: boolean;
   commandBody: string;
-  config: MoltbotConfig;
+  config: OpenClawConfig;
+  from?: PluginCommandContext["from"];
+  to?: PluginCommandContext["to"];
+  accountId?: PluginCommandContext["accountId"];
+  messageThreadId?: PluginCommandContext["messageThreadId"];
 }): Promise<PluginCommandResult> {
   const { command, args, senderId, channel, isAuthorizedSender, commandBody, config } = params;
 
@@ -240,10 +271,15 @@ export async function executePluginCommand(params: {
   const ctx: PluginCommandContext = {
     senderId,
     channel,
+    channelId: params.channelId,
     isAuthorizedSender,
     args: sanitizedArgs,
     commandBody,
     config,
+    from: params.from,
+    to: params.to,
+    accountId: params.accountId,
+    messageThreadId: params.messageThreadId,
   };
 
   // Lock registry during execution to prevent concurrent modifications
@@ -280,15 +316,33 @@ export function listPluginCommands(): Array<{
   }));
 }
 
+function resolvePluginNativeName(
+  command: OpenClawPluginCommandDefinition,
+  provider?: string,
+): string {
+  const providerName = provider?.trim().toLowerCase();
+  const providerOverride = providerName ? command.nativeNames?.[providerName] : undefined;
+  if (typeof providerOverride === "string" && providerOverride.trim()) {
+    return providerOverride.trim();
+  }
+  const defaultOverride = command.nativeNames?.default;
+  if (typeof defaultOverride === "string" && defaultOverride.trim()) {
+    return defaultOverride.trim();
+  }
+  return command.name;
+}
+
 /**
  * Get plugin command specs for native command registration (e.g., Telegram).
  */
-export function getPluginCommandSpecs(): Array<{
+export function getPluginCommandSpecs(provider?: string): Array<{
   name: string;
   description: string;
+  acceptsArgs: boolean;
 }> {
   return Array.from(pluginCommands.values()).map((cmd) => ({
-    name: cmd.name,
+    name: resolvePluginNativeName(cmd, provider),
     description: cmd.description,
+    acceptsArgs: cmd.acceptsArgs ?? false,
   }));
 }

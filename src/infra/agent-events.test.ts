@@ -39,9 +39,15 @@ describe("agent-events sequencing", () => {
   test("preserves compaction ordering on the event bus", async () => {
     const phases: Array<string> = [];
     const stop = onAgentEvent((evt) => {
-      if (evt.runId !== "run-1") return;
-      if (evt.stream !== "compaction") return;
-      if (typeof evt.data?.phase === "string") phases.push(evt.data.phase);
+      if (evt.runId !== "run-1") {
+        return;
+      }
+      if (evt.stream !== "compaction") {
+        return;
+      }
+      if (typeof evt.data?.phase === "string") {
+        phases.push(evt.data.phase);
+      }
     });
 
     emitAgentEvent({ runId: "run-1", stream: "compaction", data: { phase: "start" } });
@@ -54,5 +60,27 @@ describe("agent-events sequencing", () => {
     stop();
 
     expect(phases).toEqual(["start", "end"]);
+  });
+
+  test("omits sessionKey for runs hidden from Control UI", async () => {
+    resetAgentRunContextForTest();
+    registerAgentRunContext("run-hidden", {
+      sessionKey: "session-imessage",
+      isControlUiVisible: false,
+    });
+
+    let receivedSessionKey: string | undefined;
+    const stop = onAgentEvent((evt) => {
+      receivedSessionKey = evt.sessionKey;
+    });
+    emitAgentEvent({
+      runId: "run-hidden",
+      stream: "assistant",
+      data: { text: "hi" },
+      sessionKey: "session-imessage",
+    });
+    stop();
+
+    expect(receivedSessionKey).toBeUndefined();
   });
 });

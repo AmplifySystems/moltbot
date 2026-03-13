@@ -1,7 +1,9 @@
-import { loadConfig } from "../../config/config.js";
-import { danger } from "../../globals.js";
 import { getChannelPlugin } from "../../channels/plugins/index.js";
 import type { ChannelResolveKind, ChannelResolveResult } from "../../channels/plugins/types.js";
+import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gateway.js";
+import { getChannelsCommandSecretTargetIds } from "../../cli/command-secret-targets.js";
+import { loadConfig } from "../../config/config.js";
+import { danger } from "../../globals.js";
 import { resolveMessageChannelSelection } from "../../infra/outbound/channel-selection.js";
 import type { RuntimeEnv } from "../../runtime.js";
 
@@ -25,17 +27,29 @@ type ResolveResult = {
 function resolvePreferredKind(
   kind?: ChannelsResolveOptions["kind"],
 ): ChannelResolveKind | undefined {
-  if (!kind || kind === "auto") return undefined;
-  if (kind === "user") return "user";
+  if (!kind || kind === "auto") {
+    return undefined;
+  }
+  if (kind === "user") {
+    return "user";
+  }
   return "group";
 }
 
 function detectAutoKind(input: string): ChannelResolveKind {
   const trimmed = input.trim();
-  if (!trimmed) return "group";
-  if (trimmed.startsWith("@")) return "user";
-  if (/^<@!?/.test(trimmed)) return "user";
-  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) return "user";
+  if (!trimmed) {
+    return "group";
+  }
+  if (trimmed.startsWith("@")) {
+    return "user";
+  }
+  if (/^<@!?/.test(trimmed)) {
+    return "user";
+  }
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+    return "user";
+  }
   if (
     /^(user|discord|slack|matrix|msteams|teams|zalo|zalouser|googlechat|google-chat|gchat):/i.test(
       trimmed,
@@ -47,14 +61,25 @@ function detectAutoKind(input: string): ChannelResolveKind {
 }
 
 function formatResolveResult(result: ResolveResult): string {
-  if (!result.resolved || !result.id) return `${result.input} -> unresolved`;
+  if (!result.resolved || !result.id) {
+    return `${result.input} -> unresolved`;
+  }
   const name = result.name ? ` (${result.name})` : "";
   const note = result.note ? ` [${result.note}]` : "";
   return `${result.input} -> ${result.id}${name}${note}`;
 }
 
 export async function channelsResolveCommand(opts: ChannelsResolveOptions, runtime: RuntimeEnv) {
-  const cfg = loadConfig();
+  const loadedRaw = loadConfig();
+  const { resolvedConfig: cfg, diagnostics } = await resolveCommandSecretRefsViaGateway({
+    config: loadedRaw,
+    commandName: "channels resolve",
+    targetIds: getChannelsCommandSecretTargetIds(),
+    mode: "operational_readonly",
+  });
+  for (const entry of diagnostics) {
+    runtime.log(`[secrets] ${entry}`);
+  }
   const entries = (opts.entries ?? []).map((entry) => entry.trim()).filter(Boolean);
   if (entries.length === 0) {
     throw new Error("At least one entry is required.");

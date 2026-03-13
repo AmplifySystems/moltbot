@@ -2,7 +2,25 @@
 name: openai-image-gen
 description: Batch-generate images via OpenAI Images API. Random prompt sampler + `index.html` gallery.
 homepage: https://platform.openai.com/docs/api-reference/images
-metadata: {"moltbot":{"emoji":"🖼️","requires":{"bins":["python3"],"env":["OPENAI_API_KEY"]},"primaryEnv":"OPENAI_API_KEY","install":[{"id":"python-brew","kind":"brew","formula":"python","bins":["python3"],"label":"Install Python (brew)"}]}}
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🎨",
+        "requires": { "bins": ["python3"], "env": ["OPENAI_API_KEY"] },
+        "primaryEnv": "OPENAI_API_KEY",
+        "install":
+          [
+            {
+              "id": "python-brew",
+              "kind": "brew",
+              "formula": "python",
+              "bins": ["python3"],
+              "label": "Install Python (brew)",
+            },
+          ],
+      },
+  }
 ---
 
 # OpenAI Image Gen
@@ -10,6 +28,9 @@ metadata: {"moltbot":{"emoji":"🖼️","requires":{"bins":["python3"],"env":["O
 Generate a handful of “random but structured” prompts and render them via the OpenAI Images API.
 
 ## Run
+
+Note: Image generation can take longer than common exec timeouts (for example 30 seconds).
+When invoking this skill via OpenClaw’s exec tool, set a higher timeout to avoid premature termination/retries (e.g., exec timeout=300).
 
 ```bash
 python3 {baseDir}/scripts/gen.py

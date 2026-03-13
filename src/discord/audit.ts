@@ -1,6 +1,7 @@
-import type { MoltbotConfig } from "../config/config.js";
+import type { OpenClawConfig } from "../config/config.js";
 import type { DiscordGuildChannelConfig, DiscordGuildEntry } from "../config/types.js";
-import { resolveDiscordAccount } from "./accounts.js";
+import { isRecord } from "../utils.js";
+import { inspectDiscordAccount } from "./account-inspect.js";
 import { fetchChannelPermissionsDiscord } from "./send.js";
 
 export type DiscordChannelPermissionsAuditEntry = {
@@ -22,41 +23,58 @@ export type DiscordChannelPermissionsAudit = {
 
 const REQUIRED_CHANNEL_PERMISSIONS = ["ViewChannel", "SendMessages"] as const;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
 function shouldAuditChannelConfig(config: DiscordGuildChannelConfig | undefined) {
-  if (!config) return true;
-  if (config.allow === false) return false;
-  if (config.enabled === false) return false;
+  if (!config) {
+    return true;
+  }
+  if (config.allow === false) {
+    return false;
+  }
+  if (config.enabled === false) {
+    return false;
+  }
   return true;
 }
 
 function listConfiguredGuildChannelKeys(
   guilds: Record<string, DiscordGuildEntry> | undefined,
 ): string[] {
-  if (!guilds) return [];
+  if (!guilds) {
+    return [];
+  }
   const ids = new Set<string>();
   for (const entry of Object.values(guilds)) {
-    if (!entry || typeof entry !== "object") continue;
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
     const channelsRaw = (entry as { channels?: unknown }).channels;
-    if (!isRecord(channelsRaw)) continue;
+    if (!isRecord(channelsRaw)) {
+      continue;
+    }
     for (const [key, value] of Object.entries(channelsRaw)) {
       const channelId = String(key).trim();
-      if (!channelId) continue;
-      if (!shouldAuditChannelConfig(value as DiscordGuildChannelConfig | undefined)) continue;
+      if (!channelId) {
+        continue;
+      }
+      // Skip wildcard keys (e.g. "*" meaning "all channels") — they are valid
+      // config but are not real channel IDs and should not be audited.
+      if (channelId === "*") {
+        continue;
+      }
+      if (!shouldAuditChannelConfig(value as DiscordGuildChannelConfig | undefined)) {
+        continue;
+      }
       ids.add(channelId);
     }
   }
-  return [...ids].sort((a, b) => a.localeCompare(b));
+  return [...ids].toSorted((a, b) => a.localeCompare(b));
 }
 
 export function collectDiscordAuditChannelIds(params: {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   accountId?: string | null;
 }) {
-  const account = resolveDiscordAccount({
+  const account = inspectDiscordAccount({
     cfg: params.cfg,
     accountId: params.accountId,
   });

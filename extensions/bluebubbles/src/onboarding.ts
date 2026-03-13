@@ -1,76 +1,52 @@
 import type {
   ChannelOnboardingAdapter,
   ChannelOnboardingDmPolicy,
-  MoltbotConfig,
+  OpenClawConfig,
   DmPolicy,
   WizardPrompter,
-} from "clawdbot/plugin-sdk";
+} from "openclaw/plugin-sdk/bluebubbles";
 import {
   DEFAULT_ACCOUNT_ID,
-  addWildcardAllowFrom,
   formatDocsLink,
+  mergeAllowFromEntries,
   normalizeAccountId,
-  promptAccountId,
-} from "clawdbot/plugin-sdk";
+  patchScopedAccountConfig,
+  resolveAccountIdForConfigure,
+  setTopLevelChannelDmPolicyWithAllowFrom,
+} from "openclaw/plugin-sdk/bluebubbles";
 import {
   listBlueBubblesAccountIds,
   resolveBlueBubblesAccount,
   resolveDefaultBlueBubblesAccountId,
 } from "./accounts.js";
+import { applyBlueBubblesConnectionConfig } from "./config-apply.js";
+import { hasConfiguredSecretInput, normalizeSecretInputString } from "./secret-input.js";
+import { parseBlueBubblesAllowTarget } from "./targets.js";
 import { normalizeBlueBubblesServerUrl } from "./types.js";
-import { parseBlueBubblesAllowTarget, normalizeBlueBubblesHandle } from "./targets.js";
 
 const channel = "bluebubbles" as const;
 
-function setBlueBubblesDmPolicy(cfg: MoltbotConfig, dmPolicy: DmPolicy): MoltbotConfig {
-  const allowFrom =
-    dmPolicy === "open" ? addWildcardAllowFrom(cfg.channels?.bluebubbles?.allowFrom) : undefined;
-  return {
-    ...cfg,
-    channels: {
-      ...cfg.channels,
-      bluebubbles: {
-        ...cfg.channels?.bluebubbles,
-        dmPolicy,
-        ...(allowFrom ? { allowFrom } : {}),
-      },
-    },
-  };
+function setBlueBubblesDmPolicy(cfg: OpenClawConfig, dmPolicy: DmPolicy): OpenClawConfig {
+  return setTopLevelChannelDmPolicyWithAllowFrom({
+    cfg,
+    channel: "bluebubbles",
+    dmPolicy,
+  });
 }
 
 function setBlueBubblesAllowFrom(
-  cfg: MoltbotConfig,
+  cfg: OpenClawConfig,
   accountId: string,
   allowFrom: string[],
-): MoltbotConfig {
-  if (accountId === DEFAULT_ACCOUNT_ID) {
-    return {
-      ...cfg,
-      channels: {
-        ...cfg.channels,
-        bluebubbles: {
-          ...cfg.channels?.bluebubbles,
-          allowFrom,
-        },
-      },
-    };
-  }
-  return {
-    ...cfg,
-    channels: {
-      ...cfg.channels,
-      bluebubbles: {
-        ...cfg.channels?.bluebubbles,
-        accounts: {
-          ...cfg.channels?.bluebubbles?.accounts,
-          [accountId]: {
-            ...cfg.channels?.bluebubbles?.accounts?.[accountId],
-            allowFrom,
-          },
-        },
-      },
-    },
-  };
+): OpenClawConfig {
+  return patchScopedAccountConfig({
+    cfg,
+    channelKey: channel,
+    accountId,
+    patch: { allowFrom },
+    ensureChannelEnabled: false,
+    ensureAccountEnabled: false,
+  });
 }
 
 function parseBlueBubblesAllowFromInput(raw: string): string[] {
@@ -81,10 +57,10 @@ function parseBlueBubblesAllowFromInput(raw: string): string[] {
 }
 
 async function promptBlueBubblesAllowFrom(params: {
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   prompter: WizardPrompter;
   accountId?: string;
-}): Promise<MoltbotConfig> {
+}): Promise<OpenClawConfig> {
   const accountId =
     params.accountId && normalizeAccountId(params.accountId)
       ? (normalizeAccountId(params.accountId) ?? DEFAULT_ACCOUNT_ID)
@@ -110,10 +86,14 @@ async function promptBlueBubblesAllowFrom(params: {
     initialValue: existing[0] ? String(existing[0]) : undefined,
     validate: (value) => {
       const raw = String(value ?? "").trim();
-      if (!raw) return "Required";
+      if (!raw) {
+        return "Required";
+      }
       const parts = parseBlueBubblesAllowFromInput(raw);
       for (const part of parts) {
-        if (part === "*") continue;
+        if (part === "*") {
+          continue;
+        }
         const parsed = parseBlueBubblesAllowTarget(part);
         if (parsed.kind === "handle" && !parsed.handle) {
           return `Invalid entry: ${part}`;
@@ -123,7 +103,7 @@ async function promptBlueBubblesAllowFrom(params: {
     },
   });
   const parts = parseBlueBubblesAllowFromInput(String(entry));
-  const unique = [...new Set(parts)];
+  const unique = mergeAllowFromEntries(undefined, parts);
   return setBlueBubblesAllowFrom(params.cfg, accountId, unique);
 }
 
@@ -153,24 +133,41 @@ export const blueBubblesOnboardingAdapter: ChannelOnboardingAdapter = {
     };
   },
   configure: async ({ cfg, prompter, accountOverrides, shouldPromptAccountIds }) => {
-    const blueBubblesOverride = accountOverrides.bluebubbles?.trim();
     const defaultAccountId = resolveDefaultBlueBubblesAccountId(cfg);
-    let accountId = blueBubblesOverride
-      ? normalizeAccountId(blueBubblesOverride)
-      : defaultAccountId;
-    if (shouldPromptAccountIds && !blueBubblesOverride) {
-      accountId = await promptAccountId({
-        cfg,
-        prompter,
-        label: "BlueBubbles",
-        currentId: accountId,
-        listAccountIds: listBlueBubblesAccountIds,
-        defaultAccountId,
-      });
-    }
+    const accountId = await resolveAccountIdForConfigure({
+      cfg,
+      prompter,
+      label: "BlueBubbles",
+      accountOverride: accountOverrides.bluebubbles,
+      shouldPromptAccountIds,
+      listAccountIds: listBlueBubblesAccountIds,
+      defaultAccountId,
+    });
 
     let next = cfg;
     const resolvedAccount = resolveBlueBubblesAccount({ cfg: next, accountId });
+    const validateServerUrlInput = (value: unknown): string | undefined => {
+      const trimmed = String(value ?? "").trim();
+      if (!trimmed) {
+        return "Required";
+      }
+      try {
+        const normalized = normalizeBlueBubblesServerUrl(trimmed);
+        new URL(normalized);
+        return undefined;
+      } catch {
+        return "Invalid URL format";
+      }
+    };
+    const promptServerUrl = async (initialValue?: string): Promise<string> => {
+      const entered = await prompter.text({
+        message: "BlueBubbles server URL",
+        placeholder: "http://192.168.1.100:1234",
+        initialValue,
+        validate: validateServerUrlInput,
+      });
+      return String(entered).trim();
+    };
 
     // Prompt for server URL
     let serverUrl = resolvedAccount.config.serverUrl?.trim();
@@ -183,51 +180,23 @@ export const blueBubblesOnboardingAdapter: ChannelOnboardingAdapter = {
         ].join("\n"),
         "BlueBubbles server URL",
       );
-      const entered = await prompter.text({
-        message: "BlueBubbles server URL",
-        placeholder: "http://192.168.1.100:1234",
-        validate: (value) => {
-          const trimmed = String(value ?? "").trim();
-          if (!trimmed) return "Required";
-          try {
-            const normalized = normalizeBlueBubblesServerUrl(trimmed);
-            new URL(normalized);
-            return undefined;
-          } catch {
-            return "Invalid URL format";
-          }
-        },
-      });
-      serverUrl = String(entered).trim();
+      serverUrl = await promptServerUrl();
     } else {
       const keepUrl = await prompter.confirm({
         message: `BlueBubbles server URL already set (${serverUrl}). Keep it?`,
         initialValue: true,
       });
       if (!keepUrl) {
-        const entered = await prompter.text({
-          message: "BlueBubbles server URL",
-          placeholder: "http://192.168.1.100:1234",
-          initialValue: serverUrl,
-          validate: (value) => {
-            const trimmed = String(value ?? "").trim();
-            if (!trimmed) return "Required";
-            try {
-              const normalized = normalizeBlueBubblesServerUrl(trimmed);
-              new URL(normalized);
-              return undefined;
-            } catch {
-              return "Invalid URL format";
-            }
-          },
-        });
-        serverUrl = String(entered).trim();
+        serverUrl = await promptServerUrl(serverUrl);
       }
     }
 
     // Prompt for password
-    let password = resolvedAccount.config.password?.trim();
-    if (!password) {
+    const existingPassword = resolvedAccount.config.password;
+    const existingPasswordText = normalizeSecretInputString(existingPassword);
+    const hasConfiguredPassword = hasConfiguredSecretInput(existingPassword);
+    let password: unknown = existingPasswordText;
+    if (!hasConfiguredPassword) {
       await prompter.note(
         [
           "Enter the BlueBubbles server password.",
@@ -251,6 +220,8 @@ export const blueBubblesOnboardingAdapter: ChannelOnboardingAdapter = {
           validate: (value) => (String(value ?? "").trim() ? undefined : "Required"),
         });
         password = String(entered).trim();
+      } else if (!existingPasswordText) {
+        password = existingPassword;
       }
     }
 
@@ -268,8 +239,12 @@ export const blueBubblesOnboardingAdapter: ChannelOnboardingAdapter = {
         initialValue: existingWebhookPath || "/bluebubbles-webhook",
         validate: (value) => {
           const trimmed = String(value ?? "").trim();
-          if (!trimmed) return "Required";
-          if (!trimmed.startsWith("/")) return "Path must start with /";
+          if (!trimmed) {
+            return "Required";
+          }
+          if (!trimmed.startsWith("/")) {
+            return "Path must start with /";
+          }
           return undefined;
         },
       });
@@ -277,48 +252,22 @@ export const blueBubblesOnboardingAdapter: ChannelOnboardingAdapter = {
     }
 
     // Apply config
-    if (accountId === DEFAULT_ACCOUNT_ID) {
-      next = {
-        ...next,
-        channels: {
-          ...next.channels,
-          bluebubbles: {
-            ...next.channels?.bluebubbles,
-            enabled: true,
-            serverUrl,
-            password,
-            webhookPath,
-          },
-        },
-      };
-    } else {
-      next = {
-        ...next,
-        channels: {
-          ...next.channels,
-          bluebubbles: {
-            ...next.channels?.bluebubbles,
-            enabled: true,
-            accounts: {
-              ...next.channels?.bluebubbles?.accounts,
-              [accountId]: {
-                ...next.channels?.bluebubbles?.accounts?.[accountId],
-                enabled: next.channels?.bluebubbles?.accounts?.[accountId]?.enabled ?? true,
-                serverUrl,
-                password,
-                webhookPath,
-              },
-            },
-          },
-        },
-      };
-    }
+    next = applyBlueBubblesConnectionConfig({
+      cfg: next,
+      accountId,
+      patch: {
+        serverUrl,
+        password,
+        webhookPath,
+      },
+      accountEnabled: "preserve-or-true",
+    });
 
     await prompter.note(
       [
         "Configure the webhook URL in BlueBubbles Server:",
         "1. Open BlueBubbles Server → Settings → Webhooks",
-        "2. Add your Moltbot gateway URL + webhook path",
+        "2. Add your OpenClaw gateway URL + webhook path",
         "   Example: https://your-gateway-host:3000/bluebubbles-webhook",
         "3. Enable the webhook and save",
         "",

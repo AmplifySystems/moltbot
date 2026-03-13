@@ -1,27 +1,38 @@
-import { abortChatRun, loadChatHistory, sendChatMessage } from "./controllers/chat";
-import { loadSessions } from "./controllers/sessions";
-import { generateUUID } from "./uuid";
-import { resetToolStream } from "./app-tool-stream";
-import { scheduleChatScroll } from "./app-scroll";
-import { setLastActiveSessionKey } from "./app-settings";
-import { normalizeBasePath } from "./navigation";
-import type { GatewayHelloOk } from "./gateway";
 import { parseAgentSessionKey } from "../../../src/sessions/session-key-utils.js";
-import type { MoltbotApp } from "./app";
-import type { ChatAttachment, ChatQueueItem } from "./ui-types";
+import { scheduleChatScroll } from "./app-scroll.ts";
+import { setLastActiveSessionKey } from "./app-settings.ts";
+import { resetToolStream } from "./app-tool-stream.ts";
+import type { OpenClawApp } from "./app.ts";
+import { executeSlashCommand } from "./chat/slash-command-executor.ts";
+import { parseSlashCommand } from "./chat/slash-commands.ts";
+import { abortChatRun, loadChatHistory, sendChatMessage } from "./controllers/chat.ts";
+import { loadSessions } from "./controllers/sessions.ts";
+import type { GatewayBrowserClient, GatewayHelloOk } from "./gateway.ts";
+import { normalizeBasePath } from "./navigation.ts";
+import type { ChatAttachment, ChatQueueItem } from "./ui-types.ts";
+import { generateUUID } from "./uuid.ts";
 
-type ChatHost = {
+export type ChatHost = {
+  client: GatewayBrowserClient | null;
+  chatMessages: unknown[];
+  chatStream: string | null;
   connected: boolean;
   chatMessage: string;
   chatAttachments: ChatAttachment[];
   chatQueue: ChatQueueItem[];
   chatRunId: string | null;
   chatSending: boolean;
+  lastError?: string | null;
   sessionKey: string;
   basePath: string;
   hello: GatewayHelloOk | null;
   chatAvatarUrl: string | null;
+  refreshSessionsAfterChat: Set<string>;
+  /** Callback for slash-command side effects that need app-level access. */
+  onSlashAction?: (action: string) => void;
 };
+
+export const CHAT_SESSIONS_ACTIVE_MINUTES = 120;
 
 export function isChatBusy(host: ChatHost) {
   return host.chatSending || Boolean(host.chatRunId);
@@ -29,9 +40,13 @@ export function isChatBusy(host: ChatHost) {
 
 export function isChatStopCommand(text: string) {
   const trimmed = text.trim();
-  if (!trimmed) return false;
+  if (!trimmed) {
+    return false;
+  }
   const normalized = trimmed.toLowerCase();
-  if (normalized === "/stop") return true;
+  if (normalized === "/stop") {
+    return true;
+  }
   return (
     normalized === "stop" ||
     normalized === "esc" ||
@@ -41,16 +56,38 @@ export function isChatStopCommand(text: string) {
   );
 }
 
-export async function handleAbortChat(host: ChatHost) {
-  if (!host.connected) return;
-  host.chatMessage = "";
-  await abortChatRun(host as unknown as MoltbotApp);
+function isChatResetCommand(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const normalized = trimmed.toLowerCase();
+  if (normalized === "/new" || normalized === "/reset") {
+    return true;
+  }
+  return normalized.startsWith("/new ") || normalized.startsWith("/reset ");
 }
 
-function enqueueChatMessage(host: ChatHost, text: string, attachments?: ChatAttachment[]) {
+export async function handleAbortChat(host: ChatHost) {
+  if (!host.connected) {
+    return;
+  }
+  host.chatMessage = "";
+  await abortChatRun(host as unknown as OpenClawApp);
+}
+
+function enqueueChatMessage(
+  host: ChatHost,
+  text: string,
+  attachments?: ChatAttachment[],
+  refreshSessions?: boolean,
+  localCommand?: { args: string; name: string },
+) {
   const trimmed = text.trim();
   const hasAttachments = Boolean(attachments && attachments.length > 0);
-  if (!trimmed && !hasAttachments) return;
+  if (!trimmed && !hasAttachments) {
+    return;
+  }
   host.chatQueue = [
     ...host.chatQueue,
     {
@@ -58,6 +95,9 @@ function enqueueChatMessage(host: ChatHost, text: string, attachments?: ChatAtta
       text: trimmed,
       createdAt: Date.now(),
       attachments: hasAttachments ? attachments?.map((att) => ({ ...att })) : undefined,
+      refreshSessions,
+      localCommandArgs: localCommand?.args,
+      localCommandName: localCommand?.name,
     },
   ];
 }
@@ -71,10 +111,12 @@ async function sendChatMessageNow(
     attachments?: ChatAttachment[];
     previousAttachments?: ChatAttachment[];
     restoreAttachments?: boolean;
+    refreshSessions?: boolean;
   },
 ) {
   resetToolStream(host as unknown as Parameters<typeof resetToolStream>[0]);
-  const ok = await sendChatMessage(host as unknown as MoltbotApp, message, opts?.attachments);
+  const runId = await sendChatMessage(host as unknown as OpenClawApp, message, opts?.attachments);
+  const ok = Boolean(runId);
   if (!ok && opts?.previousDraft != null) {
     host.chatMessage = opts.previousDraft;
   }
@@ -82,7 +124,10 @@ async function sendChatMessageNow(
     host.chatAttachments = opts.previousAttachments;
   }
   if (ok) {
-    setLastActiveSessionKey(host as unknown as Parameters<typeof setLastActiveSessionKey>[0], host.sessionKey);
+    setLastActiveSessionKey(
+      host as unknown as Parameters<typeof setLastActiveSessionKey>[0],
+      host.sessionKey,
+    );
   }
   if (ok && opts?.restoreDraft && opts.previousDraft?.trim()) {
     host.chatMessage = opts.previousDraft;
@@ -94,17 +139,40 @@ async function sendChatMessageNow(
   if (ok && !host.chatRunId) {
     void flushChatQueue(host);
   }
+  if (ok && opts?.refreshSessions && runId) {
+    host.refreshSessionsAfterChat.add(runId);
+  }
   return ok;
 }
 
 async function flushChatQueue(host: ChatHost) {
-  if (!host.connected || isChatBusy(host)) return;
+  if (!host.connected || isChatBusy(host)) {
+    return;
+  }
   const [next, ...rest] = host.chatQueue;
-  if (!next) return;
+  if (!next) {
+    return;
+  }
   host.chatQueue = rest;
-  const ok = await sendChatMessageNow(host, next.text, { attachments: next.attachments });
+  let ok = false;
+  try {
+    if (next.localCommandName) {
+      await dispatchSlashCommand(host, next.localCommandName, next.localCommandArgs ?? "");
+      ok = true;
+    } else {
+      ok = await sendChatMessageNow(host, next.text, {
+        attachments: next.attachments,
+        refreshSessions: next.refreshSessions,
+      });
+    }
+  } catch (err) {
+    host.lastError = String(err);
+  }
   if (!ok) {
     host.chatQueue = [next, ...host.chatQueue];
+  } else if (host.chatQueue.length > 0) {
+    // Continue draining — local commands don't block on server response
+    void flushChatQueue(host);
   }
 }
 
@@ -117,29 +185,58 @@ export async function handleSendChat(
   messageOverride?: string,
   opts?: { restoreDraft?: boolean },
 ) {
-  if (!host.connected) return;
+  if (!host.connected) {
+    return;
+  }
   const previousDraft = host.chatMessage;
   const message = (messageOverride ?? host.chatMessage).trim();
   const attachments = host.chatAttachments ?? [];
   const attachmentsToSend = messageOverride == null ? attachments : [];
   const hasAttachments = attachmentsToSend.length > 0;
 
-  // Allow sending with just attachments (no message text required)
-  if (!message && !hasAttachments) return;
+  if (!message && !hasAttachments) {
+    return;
+  }
 
   if (isChatStopCommand(message)) {
     await handleAbortChat(host);
     return;
   }
 
+  // Intercept local slash commands (/status, /model, /compact, etc.)
+  const parsed = parseSlashCommand(message);
+  if (parsed?.command.executeLocal) {
+    if (isChatBusy(host) && shouldQueueLocalSlashCommand(parsed.command.name)) {
+      if (messageOverride == null) {
+        host.chatMessage = "";
+        host.chatAttachments = [];
+      }
+      enqueueChatMessage(host, message, undefined, isChatResetCommand(message), {
+        args: parsed.args,
+        name: parsed.command.name,
+      });
+      return;
+    }
+    const prevDraft = messageOverride == null ? previousDraft : undefined;
+    if (messageOverride == null) {
+      host.chatMessage = "";
+      host.chatAttachments = [];
+    }
+    await dispatchSlashCommand(host, parsed.command.name, parsed.args, {
+      previousDraft: prevDraft,
+      restoreDraft: Boolean(messageOverride && opts?.restoreDraft),
+    });
+    return;
+  }
+
+  const refreshSessions = isChatResetCommand(message);
   if (messageOverride == null) {
     host.chatMessage = "";
-    // Clear attachments when sending
     host.chatAttachments = [];
   }
 
   if (isChatBusy(host)) {
-    enqueueChatMessage(host, message, attachmentsToSend);
+    enqueueChatMessage(host, message, attachmentsToSend, refreshSessions);
     return;
   }
 
@@ -149,16 +246,109 @@ export async function handleSendChat(
     attachments: hasAttachments ? attachmentsToSend : undefined,
     previousAttachments: messageOverride == null ? attachments : undefined,
     restoreAttachments: Boolean(messageOverride && opts?.restoreDraft),
+    refreshSessions,
   });
 }
 
-export async function refreshChat(host: ChatHost) {
+function shouldQueueLocalSlashCommand(name: string): boolean {
+  return !["stop", "focus", "export"].includes(name);
+}
+
+// ── Slash Command Dispatch ──
+
+async function dispatchSlashCommand(
+  host: ChatHost,
+  name: string,
+  args: string,
+  sendOpts?: { previousDraft?: string; restoreDraft?: boolean },
+) {
+  switch (name) {
+    case "stop":
+      await handleAbortChat(host);
+      return;
+    case "new":
+      await sendChatMessageNow(host, "/new", {
+        refreshSessions: true,
+        previousDraft: sendOpts?.previousDraft,
+        restoreDraft: sendOpts?.restoreDraft,
+      });
+      return;
+    case "reset":
+      await sendChatMessageNow(host, "/reset", {
+        refreshSessions: true,
+        previousDraft: sendOpts?.previousDraft,
+        restoreDraft: sendOpts?.restoreDraft,
+      });
+      return;
+    case "clear":
+      await clearChatHistory(host);
+      return;
+    case "focus":
+      host.onSlashAction?.("toggle-focus");
+      return;
+    case "export":
+      host.onSlashAction?.("export");
+      return;
+  }
+
+  if (!host.client) {
+    return;
+  }
+
+  const result = await executeSlashCommand(host.client, host.sessionKey, name, args);
+
+  if (result.content) {
+    injectCommandResult(host, result.content);
+  }
+
+  if (result.action === "refresh") {
+    await refreshChat(host);
+  }
+
+  scheduleChatScroll(host as unknown as Parameters<typeof scheduleChatScroll>[0]);
+}
+
+async function clearChatHistory(host: ChatHost) {
+  if (!host.client || !host.connected) {
+    return;
+  }
+  try {
+    await host.client.request("sessions.reset", { key: host.sessionKey });
+    host.chatMessages = [];
+    host.chatStream = null;
+    host.chatRunId = null;
+    await loadChatHistory(host as unknown as OpenClawApp);
+  } catch (err) {
+    host.lastError = String(err);
+  }
+  scheduleChatScroll(host as unknown as Parameters<typeof scheduleChatScroll>[0]);
+}
+
+function injectCommandResult(host: ChatHost, content: string) {
+  host.chatMessages = [
+    ...host.chatMessages,
+    {
+      role: "system",
+      content,
+      timestamp: Date.now(),
+    },
+  ];
+}
+
+export async function refreshChat(host: ChatHost, opts?: { scheduleScroll?: boolean }) {
   await Promise.all([
-    loadChatHistory(host as unknown as MoltbotApp),
-    loadSessions(host as unknown as MoltbotApp),
+    loadChatHistory(host as unknown as OpenClawApp),
+    loadSessions(host as unknown as OpenClawApp, {
+      activeMinutes: 0,
+      limit: 0,
+      includeGlobal: false,
+      includeUnknown: false,
+    }),
     refreshChatAvatar(host),
   ]);
-  scheduleChatScroll(host as unknown as Parameters<typeof scheduleChatScroll>[0], true);
+  if (opts?.scheduleScroll !== false) {
+    scheduleChatScroll(host as unknown as Parameters<typeof scheduleChatScroll>[0]);
+  }
 }
 
 export const flushChatQueueForEvent = flushChatQueue;
@@ -169,8 +359,12 @@ type SessionDefaultsSnapshot = {
 
 function resolveAgentIdForSession(host: ChatHost): string | null {
   const parsed = parseAgentSessionKey(host.sessionKey);
-  if (parsed?.agentId) return parsed.agentId;
-  const snapshot = host.hello?.snapshot as { sessionDefaults?: SessionDefaultsSnapshot } | undefined;
+  if (parsed?.agentId) {
+    return parsed.agentId;
+  }
+  const snapshot = host.hello?.snapshot as
+    | { sessionDefaults?: SessionDefaultsSnapshot }
+    | undefined;
   const fallback = snapshot?.sessionDefaults?.defaultAgentId?.trim();
   return fallback || "main";
 }

@@ -1,11 +1,24 @@
 import fs from "node:fs";
-
-import type { MoltbotConfig } from "../config/config.js";
-import { resolveUserPath } from "../utils.js";
+import type { OpenClawConfig } from "../config/config.js";
 import { normalizePluginsConfig, type NormalizedPluginsConfig } from "./config-state.js";
-import { discoverMoltbotPlugins, type PluginCandidate } from "./discovery.js";
+import { discoverOpenClawPlugins, type PluginCandidate } from "./discovery.js";
 import { loadPluginManifest, type PluginManifest } from "./manifest.js";
+import { safeRealpathSync } from "./path-safety.js";
+import { resolvePluginCacheInputs } from "./roots.js";
 import type { PluginConfigUiHint, PluginDiagnostic, PluginKind, PluginOrigin } from "./types.js";
+
+type SeenIdEntry = {
+  candidate: PluginCandidate;
+  recordIndex: number;
+};
+
+// Precedence: config > workspace > global > bundled
+const PLUGIN_ORIGIN_RANK: Readonly<Record<PluginOrigin, number>> = {
+  config: 0,
+  workspace: 1,
+  global: 2,
+  bundled: 3,
+};
 
 export type PluginManifestRecord = {
   id: string;
@@ -33,29 +46,52 @@ export type PluginManifestRegistry = {
 
 const registryCache = new Map<string, { expiresAt: number; registry: PluginManifestRegistry }>();
 
-const DEFAULT_MANIFEST_CACHE_MS = 200;
+// Keep a short cache window to collapse bursty reloads during startup flows.
+const DEFAULT_MANIFEST_CACHE_MS = 1000;
+
+export function clearPluginManifestRegistryCache(): void {
+  registryCache.clear();
+}
 
 function resolveManifestCacheMs(env: NodeJS.ProcessEnv): number {
-  const raw = env.CLAWDBOT_PLUGIN_MANIFEST_CACHE_MS?.trim();
-  if (raw === "" || raw === "0") return 0;
-  if (!raw) return DEFAULT_MANIFEST_CACHE_MS;
+  const raw = env.OPENCLAW_PLUGIN_MANIFEST_CACHE_MS?.trim();
+  if (raw === "" || raw === "0") {
+    return 0;
+  }
+  if (!raw) {
+    return DEFAULT_MANIFEST_CACHE_MS;
+  }
   const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed)) return DEFAULT_MANIFEST_CACHE_MS;
+  if (!Number.isFinite(parsed)) {
+    return DEFAULT_MANIFEST_CACHE_MS;
+  }
   return Math.max(0, parsed);
 }
 
 function shouldUseManifestCache(env: NodeJS.ProcessEnv): boolean {
-  const disabled = env.CLAWDBOT_DISABLE_PLUGIN_MANIFEST_CACHE?.trim();
-  if (disabled) return false;
+  const disabled = env.OPENCLAW_DISABLE_PLUGIN_MANIFEST_CACHE?.trim();
+  if (disabled) {
+    return false;
+  }
   return resolveManifestCacheMs(env) > 0;
 }
 
 function buildCacheKey(params: {
   workspaceDir?: string;
   plugins: NormalizedPluginsConfig;
+  env: NodeJS.ProcessEnv;
 }): string {
-  const workspaceKey = params.workspaceDir ? resolveUserPath(params.workspaceDir) : "";
-  return `${workspaceKey}::${JSON.stringify(params.plugins)}`;
+  const { roots, loadPaths } = resolvePluginCacheInputs({
+    workspaceDir: params.workspaceDir,
+    loadPaths: params.plugins.loadPaths,
+    env: params.env,
+  });
+  const workspaceKey = roots.workspace ?? "";
+  const configExtensionsRoot = roots.global;
+  const bundledRoot = roots.stock ?? "";
+  // The manifest registry only depends on where plugins are discovered from (workspace + load paths).
+  // It does not depend on allow/deny/entries enable-state, so exclude those for higher cache hit rates.
+  return `${workspaceKey}::${configExtensionsRoot}::${bundledRoot}::${JSON.stringify(loadPaths)}`;
 }
 
 function safeStatMtimeMs(filePath: string): number | null {
@@ -100,7 +136,7 @@ function buildRecord(params: {
 }
 
 export function loadPluginManifestRegistry(params: {
-  config?: MoltbotConfig;
+  config?: OpenClawConfig;
   workspaceDir?: string;
   cache?: boolean;
   env?: NodeJS.ProcessEnv;
@@ -109,12 +145,14 @@ export function loadPluginManifestRegistry(params: {
 }): PluginManifestRegistry {
   const config = params.config ?? {};
   const normalized = normalizePluginsConfig(config.plugins);
-  const cacheKey = buildCacheKey({ workspaceDir: params.workspaceDir, plugins: normalized });
   const env = params.env ?? process.env;
+  const cacheKey = buildCacheKey({ workspaceDir: params.workspaceDir, plugins: normalized, env });
   const cacheEnabled = params.cache !== false && shouldUseManifestCache(env);
   if (cacheEnabled) {
     const cached = registryCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) return cached.registry;
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.registry;
+    }
   }
 
   const discovery = params.candidates
@@ -122,17 +160,20 @@ export function loadPluginManifestRegistry(params: {
         candidates: params.candidates,
         diagnostics: params.diagnostics ?? [],
       }
-    : discoverMoltbotPlugins({
+    : discoverOpenClawPlugins({
         workspaceDir: params.workspaceDir,
         extraPaths: normalized.loadPaths,
+        env,
       });
   const diagnostics: PluginDiagnostic[] = [...discovery.diagnostics];
   const candidates: PluginCandidate[] = discovery.candidates;
   const records: PluginManifestRecord[] = [];
-  const seenIds = new Set<string>();
+  const seenIds = new Map<string, SeenIdEntry>();
+  const realpathCache = new Map<string, string>();
 
   for (const candidate of candidates) {
-    const manifestRes = loadPluginManifest(candidate.rootDir);
+    const rejectHardlinks = candidate.origin !== "bundled";
+    const manifestRes = loadPluginManifest(candidate.rootDir, rejectHardlinks);
     if (!manifestRes.ok) {
       diagnostics.push({
         level: "error",
@@ -152,7 +193,46 @@ export function loadPluginManifestRegistry(params: {
       });
     }
 
-    if (seenIds.has(manifest.id)) {
+    const configSchema = manifest.configSchema;
+    const schemaCacheKey = (() => {
+      if (!configSchema) {
+        return undefined;
+      }
+      const manifestMtime = safeStatMtimeMs(manifestRes.manifestPath);
+      return manifestMtime
+        ? `${manifestRes.manifestPath}:${manifestMtime}`
+        : manifestRes.manifestPath;
+    })();
+
+    const existing = seenIds.get(manifest.id);
+    if (existing) {
+      // Check whether both candidates point to the same physical directory
+      // (e.g. via symlinks or different path representations). If so, this
+      // is a false-positive duplicate and can be silently skipped.
+      const samePath = existing.candidate.rootDir === candidate.rootDir;
+      const samePlugin = (() => {
+        if (samePath) {
+          return true;
+        }
+        const existingReal = safeRealpathSync(existing.candidate.rootDir, realpathCache);
+        const candidateReal = safeRealpathSync(candidate.rootDir, realpathCache);
+        return Boolean(existingReal && candidateReal && existingReal === candidateReal);
+      })();
+      if (samePlugin) {
+        // Prefer higher-precedence origins even if candidates are passed in
+        // an unexpected order (config > workspace > global > bundled).
+        if (PLUGIN_ORIGIN_RANK[candidate.origin] < PLUGIN_ORIGIN_RANK[existing.candidate.origin]) {
+          records[existing.recordIndex] = buildRecord({
+            manifest,
+            candidate,
+            manifestPath: manifestRes.manifestPath,
+            schemaCacheKey,
+            configSchema,
+          });
+          seenIds.set(manifest.id, { candidate, recordIndex: existing.recordIndex });
+        }
+        continue;
+      }
       diagnostics.push({
         level: "warn",
         pluginId: manifest.id,
@@ -160,14 +240,8 @@ export function loadPluginManifestRegistry(params: {
         message: `duplicate plugin id detected; later plugin may be overridden (${candidate.source})`,
       });
     } else {
-      seenIds.add(manifest.id);
+      seenIds.set(manifest.id, { candidate, recordIndex: records.length });
     }
-
-    const configSchema = manifest.configSchema;
-    const manifestMtime = safeStatMtimeMs(manifestRes.manifestPath);
-    const schemaCacheKey = manifestMtime
-      ? `${manifestRes.manifestPath}:${manifestMtime}`
-      : manifestRes.manifestPath;
 
     records.push(
       buildRecord({

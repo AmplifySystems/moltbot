@@ -1,12 +1,9 @@
 import { resolveAgentConfig } from "../../agents/agent-scope.js";
 import { getChannelDock } from "../../channels/dock.js";
 import { normalizeChannelId } from "../../channels/plugins/index.js";
-import type { MoltbotConfig } from "../../config/config.js";
+import type { OpenClawConfig } from "../../config/config.js";
+import { escapeRegExp } from "../../utils.js";
 import type { MsgContext } from "../templating.js";
-
-function escapeRegExp(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function deriveMentionPatterns(identity?: { name?: string; emoji?: string }) {
   const patterns: string[] = [];
@@ -24,11 +21,15 @@ function deriveMentionPatterns(identity?: { name?: string; emoji?: string }) {
 }
 
 const BACKSPACE_CHAR = "\u0008";
+const mentionRegexCompileCache = new Map<string, RegExp[]>();
+const MAX_MENTION_REGEX_COMPILE_CACHE_KEYS = 512;
 
 export const CURRENT_MESSAGE_MARKER = "[Current message - respond to this]";
 
 function normalizeMentionPattern(pattern: string): string {
-  if (!pattern.includes(BACKSPACE_CHAR)) return pattern;
+  if (!pattern.includes(BACKSPACE_CHAR)) {
+    return pattern;
+  }
   return pattern.split(BACKSPACE_CHAR).join("\\b");
 }
 
@@ -36,8 +37,10 @@ function normalizeMentionPatterns(patterns: string[]): string[] {
   return patterns.map(normalizeMentionPattern);
 }
 
-function resolveMentionPatterns(cfg: MoltbotConfig | undefined, agentId?: string): string[] {
-  if (!cfg) return [];
+function resolveMentionPatterns(cfg: OpenClawConfig | undefined, agentId?: string): string[] {
+  if (!cfg) {
+    return [];
+  }
   const agentConfig = agentId ? resolveAgentConfig(cfg, agentId) : undefined;
   const agentGroupChat = agentConfig?.groupChat;
   if (agentGroupChat && Object.hasOwn(agentGroupChat, "mentionPatterns")) {
@@ -51,9 +54,17 @@ function resolveMentionPatterns(cfg: MoltbotConfig | undefined, agentId?: string
   return derived.length > 0 ? derived : [];
 }
 
-export function buildMentionRegexes(cfg: MoltbotConfig | undefined, agentId?: string): RegExp[] {
+export function buildMentionRegexes(cfg: OpenClawConfig | undefined, agentId?: string): RegExp[] {
   const patterns = normalizeMentionPatterns(resolveMentionPatterns(cfg, agentId));
-  return patterns
+  if (patterns.length === 0) {
+    return [];
+  }
+  const cacheKey = patterns.join("\u001f");
+  const cached = mentionRegexCompileCache.get(cacheKey);
+  if (cached) {
+    return [...cached];
+  }
+  const compiled = patterns
     .map((pattern) => {
       try {
         return new RegExp(pattern, "i");
@@ -62,6 +73,12 @@ export function buildMentionRegexes(cfg: MoltbotConfig | undefined, agentId?: st
       }
     })
     .filter((value): value is RegExp => Boolean(value));
+  mentionRegexCompileCache.set(cacheKey, compiled);
+  if (mentionRegexCompileCache.size > MAX_MENTION_REGEX_COMPILE_CACHE_KEYS) {
+    mentionRegexCompileCache.clear();
+    mentionRegexCompileCache.set(cacheKey, compiled);
+  }
+  return [...compiled];
 }
 
 export function normalizeMentionText(text: string): string {
@@ -69,9 +86,13 @@ export function normalizeMentionText(text: string): string {
 }
 
 export function matchesMentionPatterns(text: string, mentionRegexes: RegExp[]): boolean {
-  if (mentionRegexes.length === 0) return false;
+  if (mentionRegexes.length === 0) {
+    return false;
+  }
   const cleaned = normalizeMentionText(text ?? "");
-  if (!cleaned) return false;
+  if (!cleaned) {
+    return false;
+  }
   return mentionRegexes.some((re) => re.test(cleaned));
 }
 
@@ -85,17 +106,30 @@ export function matchesMentionWithExplicit(params: {
   text: string;
   mentionRegexes: RegExp[];
   explicit?: ExplicitMentionSignal;
+  transcript?: string;
 }): boolean {
   const cleaned = normalizeMentionText(params.text ?? "");
   const explicit = params.explicit?.isExplicitlyMentioned === true;
   const explicitAvailable = params.explicit?.canResolveExplicit === true;
   const hasAnyMention = params.explicit?.hasAnyMention === true;
-  if (hasAnyMention && explicitAvailable) return explicit;
-  if (!cleaned) return explicit;
-  return explicit || params.mentionRegexes.some((re) => re.test(cleaned));
+
+  // Check transcript if text is empty and transcript is provided
+  const transcriptCleaned = params.transcript ? normalizeMentionText(params.transcript) : "";
+  const textToCheck = cleaned || transcriptCleaned;
+
+  if (hasAnyMention && explicitAvailable) {
+    return explicit || params.mentionRegexes.some((re) => re.test(textToCheck));
+  }
+  if (!textToCheck) {
+    return explicit;
+  }
+  return explicit || params.mentionRegexes.some((re) => re.test(textToCheck));
 }
 
 export function stripStructuralPrefixes(text: string): string {
+  if (!text) {
+    return "";
+  }
   // Ignore wrapper labels, timestamps, and sender prefixes so directive-only
   // detection still works in group batches that include history/context.
   const afterMarker = text.includes(CURRENT_MESSAGE_MARKER)
@@ -113,7 +147,7 @@ export function stripStructuralPrefixes(text: string): string {
 export function stripMentions(
   text: string,
   ctx: MsgContext,
-  cfg: MoltbotConfig | undefined,
+  cfg: OpenClawConfig | undefined,
   agentId?: string,
 ): string {
   let result = text;

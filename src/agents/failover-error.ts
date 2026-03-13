@@ -1,6 +1,11 @@
-import { classifyFailoverReason, type FailoverReason } from "./pi-embedded-helpers.js";
+import { readErrorName } from "../infra/errors.js";
+import {
+  classifyFailoverReason,
+  classifyFailoverReasonFromHttpStatus,
+  isTimeoutErrorMessage,
+  type FailoverReason,
+} from "./pi-embedded-helpers.js";
 
-const TIMEOUT_HINT_RE = /timeout|timed out|deadline exceeded|context deadline exceeded/i;
 const ABORT_TIMEOUT_RE = /request was aborted|request aborted/i;
 
 export class FailoverError extends Error {
@@ -44,91 +49,141 @@ export function resolveFailoverStatus(reason: FailoverReason): number | undefine
       return 402;
     case "rate_limit":
       return 429;
+    case "overloaded":
+      return 503;
     case "auth":
       return 401;
+    case "auth_permanent":
+      return 403;
     case "timeout":
       return 408;
     case "format":
       return 400;
+    case "model_not_found":
+      return 404;
+    case "session_expired":
+      return 410; // Gone - session no longer exists
     default:
       return undefined;
   }
 }
 
 function getStatusCode(err: unknown): number | undefined {
-  if (!err || typeof err !== "object") return undefined;
+  if (!err || typeof err !== "object") {
+    return undefined;
+  }
   const candidate =
     (err as { status?: unknown; statusCode?: unknown }).status ??
     (err as { statusCode?: unknown }).statusCode;
-  if (typeof candidate === "number") return candidate;
+  if (typeof candidate === "number") {
+    return candidate;
+  }
   if (typeof candidate === "string" && /^\d+$/.test(candidate)) {
     return Number(candidate);
   }
   return undefined;
 }
 
-function getErrorName(err: unknown): string {
-  if (!err || typeof err !== "object") return "";
-  return "name" in err ? String(err.name) : "";
-}
-
 function getErrorCode(err: unknown): string | undefined {
-  if (!err || typeof err !== "object") return undefined;
+  if (!err || typeof err !== "object") {
+    return undefined;
+  }
   const candidate = (err as { code?: unknown }).code;
-  if (typeof candidate !== "string") return undefined;
+  if (typeof candidate !== "string") {
+    return undefined;
+  }
   const trimmed = candidate.trim();
   return trimmed ? trimmed : undefined;
 }
 
 function getErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
+  if (err instanceof Error) {
+    return err.message;
+  }
+  if (typeof err === "string") {
+    return err;
+  }
   if (typeof err === "number" || typeof err === "boolean" || typeof err === "bigint") {
     return String(err);
   }
-  if (typeof err === "symbol") return err.description ?? "";
+  if (typeof err === "symbol") {
+    return err.description ?? "";
+  }
   if (err && typeof err === "object") {
     const message = (err as { message?: unknown }).message;
-    if (typeof message === "string") return message;
+    if (typeof message === "string") {
+      return message;
+    }
   }
   return "";
 }
 
 function hasTimeoutHint(err: unknown): boolean {
-  if (!err) return false;
-  if (getErrorName(err) === "TimeoutError") return true;
+  if (!err) {
+    return false;
+  }
+  if (readErrorName(err) === "TimeoutError") {
+    return true;
+  }
   const message = getErrorMessage(err);
-  return Boolean(message && TIMEOUT_HINT_RE.test(message));
+  return Boolean(message && isTimeoutErrorMessage(message));
 }
 
 export function isTimeoutError(err: unknown): boolean {
-  if (hasTimeoutHint(err)) return true;
-  if (!err || typeof err !== "object") return false;
-  if (getErrorName(err) !== "AbortError") return false;
+  if (hasTimeoutHint(err)) {
+    return true;
+  }
+  if (!err || typeof err !== "object") {
+    return false;
+  }
+  if (readErrorName(err) !== "AbortError") {
+    return false;
+  }
   const message = getErrorMessage(err);
-  if (message && ABORT_TIMEOUT_RE.test(message)) return true;
+  if (message && ABORT_TIMEOUT_RE.test(message)) {
+    return true;
+  }
   const cause = "cause" in err ? (err as { cause?: unknown }).cause : undefined;
   const reason = "reason" in err ? (err as { reason?: unknown }).reason : undefined;
   return hasTimeoutHint(cause) || hasTimeoutHint(reason);
 }
 
 export function resolveFailoverReasonFromError(err: unknown): FailoverReason | null {
-  if (isFailoverError(err)) return err.reason;
+  if (isFailoverError(err)) {
+    return err.reason;
+  }
 
   const status = getStatusCode(err);
-  if (status === 402) return "billing";
-  if (status === 429) return "rate_limit";
-  if (status === 401 || status === 403) return "auth";
-  if (status === 408) return "timeout";
+  const message = getErrorMessage(err);
+  const statusReason = classifyFailoverReasonFromHttpStatus(status, message);
+  if (statusReason) {
+    return statusReason;
+  }
 
   const code = (getErrorCode(err) ?? "").toUpperCase();
-  if (["ETIMEDOUT", "ESOCKETTIMEDOUT", "ECONNRESET", "ECONNABORTED"].includes(code)) {
+  if (
+    [
+      "ETIMEDOUT",
+      "ESOCKETTIMEDOUT",
+      "ECONNRESET",
+      "ECONNABORTED",
+      "ECONNREFUSED",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+      "EHOSTDOWN",
+      "ENETRESET",
+      "EPIPE",
+      "EAI_AGAIN",
+    ].includes(code)
+  ) {
     return "timeout";
   }
-  if (isTimeoutError(err)) return "timeout";
-
-  const message = getErrorMessage(err);
-  if (!message) return null;
+  if (isTimeoutError(err)) {
+    return "timeout";
+  }
+  if (!message) {
+    return null;
+  }
   return classifyFailoverReason(message);
 }
 
@@ -163,9 +218,13 @@ export function coerceToFailoverError(
     profileId?: string;
   },
 ): FailoverError | null {
-  if (isFailoverError(err)) return err;
+  if (isFailoverError(err)) {
+    return err;
+  }
   const reason = resolveFailoverReasonFromError(err);
-  if (!reason) return null;
+  if (!reason) {
+    return null;
+  }
 
   const message = getErrorMessage(err) || String(err);
   const status = getStatusCode(err) ?? resolveFailoverStatus(reason);

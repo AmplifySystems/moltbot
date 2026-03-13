@@ -1,17 +1,18 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { MoltbotConfig } from "../config/config.js";
-import { STATE_DIR } from "../config/paths.js";
-import { loadJsonFile, saveJsonFile } from "../infra/json-file.js";
-import { logVerbose } from "../globals.js";
+import { resolveApiKeyForProvider } from "../agents/model-auth.js";
 import type { ModelCatalogEntry } from "../agents/model-catalog.js";
 import {
   findModelInCatalog,
   loadModelCatalog,
   modelSupportsVision,
 } from "../agents/model-catalog.js";
-import { resolveApiKeyForProvider } from "../agents/model-auth.js";
 import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
+import type { OpenClawConfig } from "../config/config.js";
+import { STATE_DIR } from "../config/paths.js";
+import { logVerbose } from "../globals.js";
+import { loadJsonFile, saveJsonFile } from "../infra/json-file.js";
+import { AUTO_IMAGE_KEY_PROVIDERS, DEFAULT_IMAGE_MODELS } from "../media-understanding/defaults.js";
 import { resolveAutoImageModel } from "../media-understanding/runner.js";
 
 const CACHE_FILE = path.join(STATE_DIR, "telegram", "sticker-cache.json");
@@ -108,7 +109,7 @@ export function searchStickers(query: string, limit = 10): CachedSticker[] {
   }
 
   return results
-    .sort((a, b) => b.score - a.score)
+    .toSorted((a, b) => b.score - a.score)
     .slice(0, limit)
     .map((r) => r.sticker);
 }
@@ -130,7 +131,7 @@ export function getCacheStats(): { count: number; oldestAt?: string; newestAt?: 
   if (stickers.length === 0) {
     return { count: 0 };
   }
-  const sorted = [...stickers].sort(
+  const sorted = [...stickers].toSorted(
     (a, b) => new Date(a.cachedAt).getTime() - new Date(b.cachedAt).getTime(),
   );
   return {
@@ -142,11 +143,18 @@ export function getCacheStats(): { count: number; oldestAt?: string; newestAt?: 
 
 const STICKER_DESCRIPTION_PROMPT =
   "Describe this sticker image in 1-2 sentences. Focus on what the sticker depicts (character, object, action, emotion). Be concise and objective.";
-const VISION_PROVIDERS = ["openai", "anthropic", "google", "minimax"] as const;
+let imageRuntimePromise: Promise<
+  typeof import("../media-understanding/providers/image-runtime.js")
+> | null = null;
+
+function loadImageRuntime() {
+  imageRuntimePromise ??= import("../media-understanding/providers/image-runtime.js");
+  return imageRuntimePromise;
+}
 
 export interface DescribeStickerParams {
   imagePath: string;
-  cfg: MoltbotConfig;
+  cfg: OpenClawConfig;
   agentDir?: string;
   agentId?: string;
 }
@@ -187,15 +195,10 @@ export async function describeStickerImage(params: DescribeStickerParams): Promi
       (entry) =>
         entry.provider.toLowerCase() === provider.toLowerCase() && modelSupportsVision(entry),
     );
-    if (entries.length === 0) return undefined;
-    const defaultId =
-      provider === "openai"
-        ? "gpt-5-mini"
-        : provider === "anthropic"
-          ? "claude-opus-4-5"
-          : provider === "google"
-            ? "gemini-3-flash-preview"
-            : "MiniMax-VL-01";
+    if (entries.length === 0) {
+      return undefined;
+    }
+    const defaultId = DEFAULT_IMAGE_MODELS[provider];
     const preferred = entries.find((entry) => entry.id === defaultId);
     return preferred ?? entries[0];
   };
@@ -203,15 +206,19 @@ export async function describeStickerImage(params: DescribeStickerParams): Promi
   let resolved = null as { provider: string; model?: string } | null;
   if (
     activeModel &&
-    VISION_PROVIDERS.includes(activeModel.provider as (typeof VISION_PROVIDERS)[number]) &&
+    AUTO_IMAGE_KEY_PROVIDERS.includes(
+      activeModel.provider as (typeof AUTO_IMAGE_KEY_PROVIDERS)[number],
+    ) &&
     (await hasProviderKey(activeModel.provider))
   ) {
     resolved = activeModel;
   }
 
   if (!resolved) {
-    for (const provider of VISION_PROVIDERS) {
-      if (!(await hasProviderKey(provider))) continue;
+    for (const provider of AUTO_IMAGE_KEY_PROVIDERS) {
+      if (!(await hasProviderKey(provider))) {
+        continue;
+      }
       const entry = selectCatalogModel(provider);
       if (entry) {
         resolved = { provider, model: entry.id };
@@ -238,8 +245,8 @@ export async function describeStickerImage(params: DescribeStickerParams): Promi
 
   try {
     const buffer = await fs.readFile(imagePath);
-    // Dynamic import to avoid circular dependency
-    const { describeImageWithModel } = await import("../media-understanding/providers/image.js");
+    // Lazy import to avoid circular dependency
+    const { describeImageWithModel } = await loadImageRuntime();
     const result = await describeImageWithModel({
       buffer,
       fileName: "sticker.webp",
