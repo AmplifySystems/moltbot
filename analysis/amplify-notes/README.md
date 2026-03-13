@@ -1,7 +1,6 @@
 ---
 title: OpenClaw Analysis Notes for Amplify
 status: active
-created: '2026-03-13'
 updated: '2026-03-13'
 ---
 
@@ -17,8 +16,12 @@ Purpose: isolate OpenClaw architecture learnings in a separate repo clone, then 
 
 ## Working files
 
-- `OPENCLAW-ANALYSIS-INTAKE-CHECKLIST.md`
-- `OPENCLAW-TO-FRESHHOUSE-TRANSLATION-MATRIX.md`
+- `OPENCLAW-ANALYSIS-INTAKE-CHECKLIST.md` (completed 2026-03-13)
+- `OPENCLAW-TO-FRESHHOUSE-TRANSLATION-MATRIX.md` (filled)
+
+## Full findings (canonical)
+
+**FreshHouse-Network:** `0_amplify-systems/docs/implementation/OPENCLAW-FINDINGS.md` — bootstrap file set, injection order, SOUL template, memory/session/compaction, tool/safety boundaries, translation decisions for Quan and Sky Fresh Singh.
 
 ## Handoff rule
 
